@@ -1,0 +1,12 @@
+[package]
+name = "tpdrv"
+version = "0.1.0"
+edition = "2024"
+description = "Clean-room injected socket-interception hook DLL (mirrors the original's driver DLL). Windows only."
+
+[lib]
+name = "tpdrv"
+crate-type = ["cdylib"]
+
+# Deliberately dependency-free: raw extern "system" Win32/WinSock declarations,
+# matching the original's tiny import surface (kernel32/user32/ws2_32).

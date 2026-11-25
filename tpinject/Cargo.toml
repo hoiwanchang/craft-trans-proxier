@@ -1,0 +1,13 @@
+[package]
+name = "tpinject"
+version = "0.1.0"
+edition = "2024"
+description = "Clean-room transparent-proxification engine host: named-pipe decision server + local relay (mirrors the original engine). Windows only."
+
+[[bin]]
+name = "tpinject"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the existing rule engine + SOCKS/HTTP relay WITHOUT the GUI/eframe tree.
+trans-proxier = { path = "..", default-features = false }

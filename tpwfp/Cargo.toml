@@ -1,0 +1,17 @@
+[package]
+name = "tpwfp"
+version = "0.1.0"
+edition = "2024"
+description = "User-mode WFP callout DLL for per-app connection redirect (no kernel driver, no signing). Loaded by the Base Filtering Engine. Windows only; the classify DECISION logic is unit-tested, the FFI wiring compiles-only (needs admin + a live BFE to verify — see docs/WFP_ROADMAP.md)."
+
+[lib]
+name = "tpwfp"
+# cdylib → the DLL the BFE loads; rlib → so `cargo test -p tpwfp` can build the
+# unit tests against the pure helpers (remote_from_sockaddr, Classify default).
+crate-type = ["cdylib", "rlib"]
+
+# The shared, cross-platform decision logic lives in the main crate so it is
+# unit-testable without a live BFE; only the thin FFI shim here is Windows-only
+# and compile-verified.
+[dependencies]
+trans-proxier = { path = "..", default-features = false }

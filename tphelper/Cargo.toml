@@ -1,0 +1,15 @@
+[package]
+name = "tphelper"
+version = "0.1.0"
+edition = "2024"
+description = "Clean-room bitness broker that loads the hook DLL and calls InitFilter3 (mirrors the original's helper exe). Windows only."
+
+[[bin]]
+name = "tphelper"
+path = "src/main.rs"
+
+[[bin]]
+name = "tpprobe"
+path = "src/bin/tpprobe.rs"
+
+[dependencies]

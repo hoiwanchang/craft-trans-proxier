@@ -1,0 +1,26 @@
+target/
+target_*/
+# customer product — read-only reference, never publish
+original/
+ProxifierPE.zip
+# throwaway demo/scratch
+scratch_*
+*.log
+
+# driver build outputs (never commit a .sys, .pdb or a private key)
+driver_wfp/out/
+driver_wfp/build_cl/
+*.obj
+*.pdb
+*.sys
+*.exp
+*.lib
+
+# built distribution folders (binaries; rebuild with cargo)
+dist/
+
+# text dumps taken from the proprietary binary — analysis material, not ours to publish
+tools/out_*.txt
+tools/sub_*.txt
+tools/_*.txt
+

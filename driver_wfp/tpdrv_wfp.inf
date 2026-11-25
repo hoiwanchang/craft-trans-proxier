@@ -1,0 +1,56 @@
+; tpdrv_wfp.inf — install package for the trans-proxier WFP callout driver.
+;
+; Test-signing hosts only. A kernel driver must be attestation-signed by Microsoft
+; to load on a normal Windows 10/11 machine; see driver_wfp/README.md.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = tpdrv_wfp.cat
+DriverVer   = 11/25/2026,0.1.0.0
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+tpdrv_wfp.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = TpDrvWfp_Install, Root\TpDrvWfp
+
+[TpDrvWfp_Install.NT]
+CopyFiles = TpDrvWfp_CopyFiles
+
+[TpDrvWfp_CopyFiles]
+tpdrv_wfp.sys
+
+; No [Install.NT.HW]/AddReg block on purpose: the driver is configured entirely at run
+; time by the service through IOCTL_TPDRV_SET_CONFIG (pid, token pools, enable flag), and
+; stays loaded-but-inert until it is. A kernel driver has nothing to say with
+; SafeDllSearchMode or a device registry key, so inventing one here would only be noise.
+
+[TpDrvWfp_Install.NT.Services]
+AddService = TpDrvWfp,%SPSVCINST_ASSOCSERVICE%,TpDrvWfp_ServiceInstall
+
+[TpDrvWfp_ServiceInstall]
+DisplayName    = %SvcDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START (start it explicitly, never at boot)
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\tpdrv_wfp.sys
+
+[Strings]
+ProviderName           = "trans-proxier"
+DeviceDesc             = "trans-proxier WFP callout"
+SvcDesc                = "trans-proxier WFP callout driver"
+DiskName               = "trans-proxier WFP callout installation disk"
+SPSVCINST_ASSOCSERVICE = 0x00000002

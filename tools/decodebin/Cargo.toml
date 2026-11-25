@@ -1,0 +1,14 @@
+[package]
+name = "decodebin"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: do NOT inherit the parent workspace.
+[workspace]
+
+[[bin]]
+name = "decodebin"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 0

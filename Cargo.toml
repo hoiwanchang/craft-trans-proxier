@@ -1,0 +1,19 @@
+[workspace]
+members = [".", "tpdrv", "tphelper", "tpinject", "tpwfp"]
+
+[package]
+name = "trans-proxier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+eframe = { version = "0.37.0", optional = true }
+
+[features]
+# The desktop GUI (and the `trans-proxier gui` subcommand) is behind a default
+# feature so the Windows interception crate `tpinject` can reuse the rule /
+# relay engine without pulling in the whole eframe/wgpu dependency tree.
+default = ["gui"]
+gui = ["dep:eframe"]
