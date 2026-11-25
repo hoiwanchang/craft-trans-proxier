@@ -61,9 +61,13 @@ fn until(deadline: Duration, cond: impl Fn() -> bool) -> bool {
 }
 
 #[test]
-#[ignore = "does not complete in 60 s: the narrow-injection claim is not yet verified \
-            end to end, and an injector must not stall its target — investigate, do not un-ignore"]
 fn only_the_whitelisted_image_ever_sees_the_dll() {
+    // Run as our OWN engine instance: the mutex is session-scoped, so a real running
+    // engine makes `Engine::start` fail with "另一个透明引擎实例已在运行" — an environment
+    // collision that looks exactly like a product bug. That is what this test actually
+    // hit (it failed in 0.6 s, not the 60 s I had blamed on the injector).
+    unsafe { std::env::set_var("TPROXIER_INSTANCE", "injecttest") };
+
     let dll = dll_of_target_dir();
     assert!(std::path::Path::new(&dll).exists(), "build tpdrv.dll first: {dll}");
 
@@ -116,4 +120,24 @@ fn only_the_whitelisted_image_ever_sees_the_dll() {
         !other_touched,
         "{UNLISTED} carries tpdrv.dll although the profile never named it"
     );
+
+    }
+/// Bisect for the teardown hang: same engine, same start/stop, but a whitelist that
+/// names a process that cannot exist, so NOTHING is ever injected. If the stop still
+/// hangs, the fault is in the servers/pipe shutdown, not in remote eject.
+#[test]
+fn stopping_without_any_injection_is_bounded() {
+    unsafe { std::env::set_var("TPROXIER_INSTANCE", "stoptest") };
+    let dll = dll_of_target_dir();
+    let mut cfg = Config::default();
+    cfg.settings.app_whitelist_enabled = true;
+    cfg.settings.app_whitelist = vec!["definitely-not-running.exe".to_string()];
+    let engine = intercept::Engine::start(Arc::new(RwLock::new(cfg)), Arc::new(Monitor::new()), &dll)
+        .expect("engine should start");
+    std::thread::sleep(Duration::from_millis(1200));
+    let t = Instant::now();
+    drop(engine);
+    let took = t.elapsed();
+    println!("drop with zero injections took {:?}", took);
+    assert!(took < Duration::from_secs(10), "shutdown hung for {:?}", took);
 }
