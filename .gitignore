@@ -24,3 +24,6 @@ tools/out_*.txt
 tools/sub_*.txt
 tools/_*.txt
 
+# python scratch
+__pycache__/
+*.pyc
