@@ -1,0 +1,4 @@
+# PowerShell scripts: keep bytes as committed. Windows PowerShell 5.1 decodes a
+# BOM-less .ps1 using the machine ANSI codepage, so non-ASCII text in them is only
+# safe with the BOM present — do not let git rewrite it away.
+*.ps1 -text

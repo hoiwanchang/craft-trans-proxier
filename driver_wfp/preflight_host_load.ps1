@@ -1,4 +1,4 @@
-# Read-only preflight: can this machine load a test-signed kernel driver, and what
+﻿# Read-only preflight: can this machine load a test-signed kernel driver, and what
 # would we have to weaken to get there? Nothing here changes any state.
 $ErrorActionPreference = 'SilentlyContinue'
 

@@ -1,4 +1,4 @@
-# vm_check.ps1 — the whole WFP kernel-redirect acceptance run, start to finish, in one
+﻿# vm_check.ps1 — the whole WFP kernel-redirect acceptance run, start to finish, in one
 # command. FOR A VIRTUAL MACHINE ONLY.
 #
 # This is the script that answers the only question left on the WFP item: does the loaded

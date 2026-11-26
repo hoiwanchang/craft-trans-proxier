@@ -1,4 +1,4 @@
-# build_cl.ps1 — compile AND link tpdrv_wfp.sys with plain MSVC + the WDK's km headers,
+﻿# build_cl.ps1 — compile AND link tpdrv_wfp.sys with plain MSVC + the WDK's km headers,
 # no Visual Studio solution and no WDK *installation* required.
 #
 # Why this exists alongside build.ps1: build.ps1 drives the .vcxproj, which needs the WDK

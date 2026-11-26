@@ -1,4 +1,4 @@
-# build.ps1 — compile + package tpdrv_wfp.sys with the installed WDK.
+﻿# build.ps1 — compile + package tpdrv_wfp.sys with the installed WDK.
 #
 # Operator-run by design: this workspace has no WDK, so nothing here has ever
 # executed. Read driver_wfp/README.md before running it, run it in a VM, and expect

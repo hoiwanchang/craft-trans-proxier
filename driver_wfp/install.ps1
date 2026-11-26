@@ -1,4 +1,4 @@
-# install.ps1 / uninstall.ps1 — load and remove the WFP callout (VM ONLY).
+﻿# install.ps1 / uninstall.ps1 — load and remove the WFP callout (VM ONLY).
 #
 # Neither has ever been run. They are here so the operator does not have to invent
 # the plumbing, and they refuse to act unless -IDeclareIAmInAVM is passed: a

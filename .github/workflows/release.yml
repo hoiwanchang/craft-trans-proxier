@@ -64,7 +64,36 @@ jobs:
           if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
             choco install mingw -y --no-progress | Out-Null
           }
-          (Get-Command gcc -ErrorAction SilentlyContinue) ? "gcc: $(gcc --version | Select-Object -First 1)" : "gcc unavailable"
+          $g = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $g) {
+            # choco drops mingw in C:\tools\mingw64\bin; a machine-PATH change made by
+            # choco is not guaranteed to be visible to the NEXT step's shell, so write it
+            # to GITHUB_PATH rather than hoping.
+            $guess = 'C:\tools\mingw64\bin'
+            if (Test-Path "$guess\gcc.exe") { $guess | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append; $g = "$guess\gcc.exe" }
+          }
+          if ($g) { Write-Host "gcc: $(( & gcc --version | Select-Object -First 1 ))" }
+          else { Write-Host '::warning::gcc is not available; the driver offline checks will be skipped, not passed' }
+
+      # Regression guard for the failure this pipeline was born with: a BOM-less .ps1
+      # containing non-ASCII is decoded by Windows PowerShell 5.1 using the machine ANSI
+      # codepage, which on a 1252 runner turns an em dash into bytes that swallow the
+      # closing quote — a parse error locally invisible because the dev box ran GBK.
+      - name: every PowerShell script must parse under 5.1
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | Where-Object { $_.FullName -notlike "*$([char]92)target$([char]92)*" } | ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+            $nonAscii = ($bytes | Where-Object { $_ -gt 127 }).Count -gt 0
+            if ($nonAscii -and -not $hasBom) { Write-Host "::error::$($_.Name) has non-ASCII text but no UTF-8 BOM"; $bad++ }
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { Write-Host "::error::$($_.Name) does not parse: $($errs[0].Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
+          Write-Host "all PowerShell scripts parse under Windows PowerShell 5.1"
 
       - name: run offline checks
         shell: pwsh
