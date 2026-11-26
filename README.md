@@ -28,7 +28,7 @@ copied; originals live under `original/` (git-ignored) and are never run.
 CARGO_HTTP_PROXY=http://127.0.0.1:7890 cargo fetch
 # …and the live interception suite in a 32-bit process (the hook ships both bitnesses;
 # i686 has its own install path — `push imm32; ret` instead of the 14-byte RIP jump):
-CARGO_TARGET_DIR=target_check cargo test -p trans-proxier --no-default-features     --target i686-pc-windows-msvc --test transparent_windows
+cargo test -p trans-proxier --target i686-pc-windows-msvc --test transparent_windows   # rebuild the 32-bit tpdrv.dll first
 
 cargo build --workspace                       # GUI default + all native crates
 cargo run                                     # opens the GUI (bare invocation)
@@ -42,29 +42,29 @@ cross-bitness story).
 
 ### Important: build in a separate target dir
 
-A past experiment that installed the **global message hook** mapped the old
-`tpdrv.dll` into ~33 of the operator's running apps, which keeps
-`target/debug/tpdrv.dll` file-locked. Until those apps are closed, the *fixed*
-hook cannot be written into `target/debug`. Build/test with:
+Close the locked-file case properly — and there is only one proper way.
 
-```sh
-CARGO_TARGET_DIR=target_check cargo build --workspace
-CARGO_TARGET_DIR=target_check cargo test  --workspace
-```
+When a running engine, or an app still holding an older injected `tpdrv.dll`, has
+`target/debug/tpdrv.dll` locked, the build fails with `os error 5` and the STALE dll
+stays where it is. The live suite then trips its own precondition in 0.4 seconds, which
+is indistinguishable from a code regression. Fix it by **closing the running engine /
+the affected apps (or rebooting) and rebuilding in the same directory**.
 
-The complete, verified artifact set is in `target_check/debug/` (+ `i686`). To
-land them in `target/debug`: close the affected apps (or reboot), then a normal
-`cargo build --workspace`.
-
+Do NOT work around it by pointing `CARGO_TARGET_DIR` at a scratch directory. That is
+exactly what caused the 2026-11-26 desktop outage: four build directories plus the
+installed copy meant five distinct `tpdrv.dll` paths, and 65 processes ended up with
+several of them mapped at once — a global message hook re-injects by path, so each new
+directory is a fresh stacked inline detour over the same `ws2_32` functions. Nearly every
+application on the machine crashed. One source tree, one `target/`, always.
 ### …and the stale-DLL trap that masquerades as a broken hook (measured 2026-11-25)
 
 `tpdrv.dll` gets pinned by every process the global message hook has touched. Enumerating
 loaded modules on this workstation found it mapped into **301 processes**, from three
-builds at once — `target/debug`, `target_check/debug`, and the installed copy at
+builds at once — `target/debug`, a scratch `target_check/debug` (the mistake above), and the installed copy at
 `D:\ProgramFiles\trans-proxier-win-x64`. So a build can fail like this:
 
 ```
-error: failed to remove file `…	arget_check\debug	pdrv.dll` … 拒绝访问 (os error 5)
+error: failed to remove file `…\target\debug\tpdrv.dll` … 拒绝访问 (os error 5)
 ```
 
 and **cargo then runs whatever old DLL is still on that path**. `tests/transparent_windows.rs`
@@ -123,13 +123,14 @@ relocated prologue instead of just installing it. All of that is in
 | WFP **control plane** (layer/condition GUIDs, `FWPM_*` layouts, callout-object registration, dynamic session, fail-open filter flag) — plus `trans-proxier wfp` to preview/arm it (consent-gated), `wfp --apply` **supervised** (re-arms the token pool when the driver drifts, disarms on exit), and `wfp --verify` as the acceptance gate, whose last row demands the kernel attributed the flow to *this* process | `wfp::tests::abi_*` pinned against SDK 10.0.26100 headers **and re-checked by an independent C compiler** (`gcc driver_wfp/abi_check.c && ./abi_check` — every size/offset/action/type agrees, and it fails on drift); **`FwpmEngineOpen0` handshake executed against the live BFE** (`cargo test --lib wfp:: -- --ignored`, passes un-elevated: session accepted, sublayer correctly denied); `cli::wfp_verb_tests` (20: dry-run, consent refusal, missing-driver refusal, empty whitelist, happy path, gate-row attribution, incapable-driver refusal, short-status refusal, read-only-report-without-profile, claim-theft refusal, plus the record-ABI, transport-split and preview cases) + the verb run end-to-end on this host |
 | `InitFilter3` disassembles identically to `PrxDrvPE64.dll`; real x86-64 instruction-length decoder | `decode` 9 unit tests; ledger evidence |
 
-Test count: **278 Rust green, 0 failed** (x64) — **and the same live interception suite green under `i686-pc-windows-msvc`, with `TpdrvHookStatus` = `0x07fff` (15/15 detours) in both bitnesses** (`cargo test --workspace --no-fail-fast` with
-`CARGO_TARGET_DIR=target_probe`, 2026-11-25 — `cargo_exit=0`, not a piped tail's status).
+Test count: **304 Rust green, 0 failed** in **both** the debug and the release profile (2026-11-26, after the `fd_set` rewrite, the targeted-injection change and the shutdown-deadlock fix) — **and the live interception suite also green under `i686-pc-windows-msvc`**, re-run that same day (it needs the 32-bit `tpdrv.dll` rebuilt first, or the suite fails on its own stale-artifact precondition rather than on code).
+Both figures come from `cargo test --workspace --no-fail-fast` (and the same with `--release`) read off the aggregated `test result:` lines — never from a piped tail's exit status, and never with a `target_probe`-style scratch dir: those were all deleted on 2026-11-26 to reclaim 17 GB, and `target/` is the only build dir this project uses now.
 **Trap that produces a false failure:** a third-party app in the session can still hold a
-mapping on an older `target_check/debug/tpdrv.dll` (loaded back when a global hook was live),
+mapping on an older `target/debug/tpdrv.dll` — from a global hook that was live, or simply
+  from the engine he is running right now —
 and then `cargo build` fails that relink with `os error 5` while the *stale* DLL — one without
 `TpdrvHookStatus` — stays in place. The live suite's precondition assert then fires
-in 0.4 s and reads exactly like a code regression. Check the artifact, not the code: `python -c "print(open('target_check/debug/tpdrv.dll','rb').read().count(b'TpdrvHookStatus'))"` → 0 means stale; run the suite in a target dir nothing has mapped.
+in 0.4 s and reads exactly like a code regression. Check the artifact, not the code: `python -c "print(open('target/debug/tpdrv.dll','rb').read().count(b'TpdrvHookStatus'))"` → 0 means stale; rebuild that target's `tpdrv.dll` (or close the running engine) before believing a red.
 Also **185 host-run C checks** in `driver_wfp/`: 70 on the byte encoders, the config-buffer bounds and the control-device authorisation truth table (including a
 golden 72-byte buffer asserted identically in both languages) and 115 that execute the
 driver's own classify callback + notifyFn — including a 4000-case **invariant sweep** over randomised
@@ -145,6 +146,42 @@ bytes the compiled classify path actually emits — in BOTH address families: `t
 `wfp_classify.rs` decodes the same buffer, so the kernel↔service contract is pinned by
 execution rather than by two readings of the same idea — perturbing one byte on either
 side fails exactly one test. 0 warnings, x64 + i686.
+
+
+## 功能清单 / Feature matrix（2026-11-26）
+
+状态口径 / what each mark means：
+**✅ 已验证 verified** = 有可运行的测试或实测证据；**🟡 部分 partial** = 功能在，但有明确未覆盖的边界；
+**⛔ 未完成 not done** = 没做或已回退；**👁 需目视 needs your eyes** = 逻辑与编译通过，我从没在屏幕上看到过（本会话显示环境渲染全黑）。
+
+| # | 功能 Feature | 状态 Status | 证据 / 边界 Evidence & limits |
+|---|---|---|---|
+| 1 | 无驱动拦截：ws2_32 全部 15 个 detour（connect/WSAConnect/sendto/recvfrom/recv/WSASendTo/WSARecvFrom/WSAIoctl/getaddrinfo/freeaddrinfo/select/WSAEventSelect/WSAEnumNetworkEvents/CreateIoCompletionPort/closesocket）<br>Driverless interception: all 15 ws2_32 detours | ✅ | x64 与 i686 均 `TpdrvHookStatus=0x07fff`；`tests/transparent_windows.rs` 实时套件两架都过（i686 于 2026-11-26 复测，需先重建 32 位 tpdrv.dll，否则撞上陈旧产物） |
+| 2 | TCP 透明代理（域名/IP/规则匹配、fake-IP）<br>TCP proxification with rules and fake-IP | ✅ | 实时用例经 SOCKS5 CONNECT 隧道；规则/协议/端口/应用匹配有单测 |
+| 3 | UDP：连接型 + 无连接（sendto/recvfrom）<br>Connected + unconnected UDP | ✅ | 走 SOCKS5 UDP ASSOCIATE；含 IPv6 目标（ATYP 4） |
+| 4 | **重叠/回收的 UDP token 不复用错流**<br>Recycled UDP token must not misroute | ✅ | 该场景曾真实错转发（把 B 的数据送给 A），已修复并被实时用例守住 |
+| 5 | IPv6 全链路：v6 目的地、v6 应用套接字（V6ONLY 走 `[::1]` 中继）<br>Full IPv6 path | ✅ | v4/v6 流记录被钉成跨语言字节向量 |
+| 6 | 应用的 `:53` 经代理转发（含解析器改写与日志）<br>App DNS (:53) through the proxy | ✅ | 目标项 (b)；`DNS 解析器改写:` 日志 + 实时断言；DoT(TCP) 应答也窥探 |
+| 7 | 代理链与两种出口（SOCKS5 / HTTP CONNECT），连通性检查<br>Chains, SOCKS5 + HTTP-CONNECT egress, checks | ✅ | `check --proxy/--chain`、`chain.rs`/`http_connect.rs` 测试 |
+| 8 | **只向白名单程序注入**（不再是全局消息钩子）<br>Targeted per-process injection only | ✅ | 端到端实测：名单内 charmap 202ms 内注入；名单外进程未加载且仍存活（有存活断言防"空转通过"） |
+| 9 | 禁止叠加安装（命名互斥体单一主人）；每进程只尝试一次<br>One-owner gate; one attempt per pid | ✅ | 起因是真实事故：5 份副本叠加在 65 个进程里 → 桌面几乎全线崩溃 |
+| 10 | 可还原：补丁账本 + `TpdrvRemove` + 停止广播；钩子 panic 不再拖死宿主<br>Restorable patches; panics fenced | ✅ | `select_abi_tests`/`fence_tests`；红→绿双向验证 |
+| 11 | **停止后能真正退出**（管道 accept 唤醒，不再挂死）<br>Engine shutdown no longer deadlocks | ✅ | 根因：对含未完成操作的句柄 `CloseHandle` 会等待该操作；改为自连唤醒。#21 |
+| 12 | 实时日志过滤：协议 / 目的 IP / 端口 / 是否直连，默认只显示走代理的<br>Live-log filter incl. proxied-only default | ✅👁 | 谓词是纯函数且有单测（非流行永不隐藏、半输入不清空）；**面板外观需你目视** |
+| 13 | 托盘菜单 + 多尺寸图标（按 DPI 选档）<br>Tray menu + DPI-sized icon | ✅👁 | 图标已内嵌 exe 并解析校验；**观感需你目视** |
+| 14 | Profiles：多档案、加密保存、启动加载<br>Profiles with encryption | 🟡👁 | 逻辑测试通过；对话框从未在屏幕上看到 |
+| 15 | WFP 内核重定向（callout 驱动 + 控制面）<br>WFP kernel redirect | ⛔🟡 | 用户态控制面、驱动源码、ABI 布局、classify 逻辑执行（185 C 检查含 4000 例不变量）与**已签名镜像**都在；**唯一没做的：在 test-signing VM 里加载并让 `wfp --verify` 全绿**（任务 #4） |
+| 16 | DNS 地址族裁剪（按代理链路能力丢弃 AAAA/A）<br>DNS family trimming | 🟡⛔默认关 | 机制与包构造有测试；`egress_family` 默认 `dual`＝不裁剪。原因：你的出口有 v6 而本机无 v6，本地路由表不是证据，误裁剪会让 v6-only 站点永久不可达 |
+| 17 | DoH / TRR（Firefox 自建 DNS）场景<br>DoH/TRR coverage | ⛔ | DNS 在 TLS 内，我们不解析；族裁剪对这条路径无效（已记录在案） |
+| 18 | 打补丁/还原时逐线程挂起（防撕裂执行）#22<br>Per-thread suspend around patching | ⛔已回退 | 代码在 `stash@{0}`。两条硬结论：`NtSuspendProcess(self)` 直接冻死本进程；改逐线程后仍把一个 charmap 卡住 20 分钟 ⇒ 风险大于收益 |
+| 19 | 从宿主进程真正卸载镜像 #23<br>Real unmap from hosts | ⛔已回退 | 同一 stash；协议已设计（宿主回执计数 → 用**该进程自己的** HMODULE 远程 `FreeLibrary` → 验证模块消失）。不可消除的残留风险：宿主缓存了指向跳板的函数指针 |
+| 20 | 被注入应用内存里的 tpdrv.dll 镜像在应用退出前不会消失（行为已撤销）<br>Image stays mapped until host exits | 🟡 设计所限 | 这是 #19 的取舍，不是缺陷掩盖 |
+| 21 | `select()` 钩子内的唤醒改为 20ms 轮询<br>select hook now polls at 20 ms | 🟡 | 为消除 fd_set 越界而重写；唤醒精度弱于原生实现，CPU 代价极小但存在 |
+| 22 | 更高完整性级别进程（服务/管理员程序）覆盖<br>Elevated / service coverage | ⛔ | 需管理员运行引擎，或由 #15 的 WFP 路线覆盖——后者正是它的存在理由 |
+| 23 | 32 位真实应用的端到端注入验证<br>Real 32-bit host end to end | 🟡 | 模块快照已加 `SNAPMODULE32`（否则会反复重注入同一进程，曾导致引擎每秒 +1 线程）；但**未在真实 32 位 GUI 应用上跑通验证** |
+
+规模 / scale：**304 个 Rust 测试通过 / 0 失败**（debug 与 release 一致）+ **185 项宿主 C 检查**；仓库 `main` @ `d744a8f`。
+待办优先级 / next in line：**#15 的 VM 加载**（唯一没有证据的目标项）→ 你的 **GUI 目视**（#12/#13/#14）→ 出现撕裂执行症状时才回到 #18/#19。
 
 ## PENDING — what is NOT done, and what you must provide
 
