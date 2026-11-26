@@ -22,6 +22,8 @@ copied; originals live under `original/` (git-ignored) and are never run.
 | `tpwfp` | user-mode WFP callout DLL (redirect decision) | cdylib |
 
 ## Build & run
+CI lives in `.github/workflows/release.yml`: on every push it runs `cargo test --workspace --lib --bins` (279 tests as of 2026-11-26) and the WDK-free driver checks, and on a `v*` tag it builds both bitnesses and publishes `trans-proxier-win-x64.zip` as a Release. The suites under `tests/` that install the hook into their own process — and the one that injects a real GUI app — are local-only by design: they need an interactive desktop, and a test that patches other processes should not run unattended on a shared runner. `driver_wfp/preflight_host_load.ps1` reports, read-only, whether a machine could even load the test-signed callout.
+
 
 ```sh
 # deps (crates.io) only reachable via the operator's local mixed proxy:
