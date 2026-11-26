@@ -23,6 +23,8 @@ struct Args {
     once: bool,
     verify: bool,
     consent_wfp: bool,
+    /// passed by the logon (HKCU Run) entry: start in the tray, no window
+    minimised: bool,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -41,6 +43,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         once: false,
         verify: false,
         consent_wfp: false,
+        minimised: false,
     };
     let mut rest = argv;
     // argv[0] is the program path; argv[1] is the command (or nothing, or flags)
@@ -117,6 +120,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--apply" => a.apply = true,
             "--verify" => a.verify = true,
             "--once" => a.once = true,
+            // what the logon entry passes; unknown flags otherwise fall into `positional`,
+            // which would make autostart silently open a window instead of the tray
+            "--minimised" => a.minimised = true,
             "--i-consent-to-install-wfp-filters" => a.consent_wfp = true,
             "--help" | "-h" => {
                 return Err("help".into());
@@ -128,11 +134,85 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     Ok(a)
 }
 
+/// `trans-proxier autostart install|remove|status` — the per-user logon entry.
+///
+/// `install` reads the registry back and compares before claiming success: a return code
+/// alone says the write call was accepted, not that the machine will now do what you
+/// think it will, and this is the kind of setting whose failure only shows up at next
+/// boot — when nobody is watching.
+fn cmd_autostart(args: &Args) -> u8 {
+    #[cfg(windows)]
+    {
+        use crate::autostart;
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "trans-proxier.exe".into());
+        match args.positional.first().map(|s| s.as_str()).unwrap_or("") {
+            "install" => match autostart::install(&exe) {
+                Ok(cmd) => match autostart::status() {
+                    Ok(Some(v)) if v == cmd => {
+                        println!("registered at logon and verified: {v}");
+                        0
+                    }
+                    other => {
+                        eprintln!("warning: written, but read-back does not match: {other:?}");
+                        1
+                    }
+                },
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
+            },
+            "remove" => match autostart::remove() {
+                Ok(()) => {
+                    println!("removed; registry now holds {:?}", autostart::status().ok().flatten());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
+            },
+            "status" => match autostart::status() {
+                Ok(Some(v)) => {
+                    println!("enabled: {v}");
+                    0
+                }
+                Ok(None) => {
+                    println!("not registered (the app runs only when you start it)");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
+            },
+            other => {
+                eprintln!("usage: trans-proxier autostart install|remove|status");
+                if !other.is_empty() {
+                    eprintln!("       unknown argument: {other}");
+                }
+                2
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        eprintln!("error: the logon entry is Windows-only");
+        1
+    }
+}
+
 const USAGE: &str = "\
 trans-proxier — clean-room transparent proxy engine (Rust)
 
 Usage:
   trans-proxier                            Open the GUI (default)
+  trans-proxier --minimised                 Open hidden in the tray (what logon uses)
+  trans-proxier autostart install|remove|status
+                                            Register / clear / show the per-user logon entry
   trans-proxier gui                        Open the GUI
   trans-proxier init                       Write a sample Settings.ini
   trans-proxier validate                   Check the config file
@@ -186,6 +266,7 @@ pub fn run(argv: Vec<String>) -> u8 {
         "route" => cmd_route(&args),
         "serve" => cmd_serve(&args),
         "profiles" => cmd_profiles(&args),
+        "autostart" => cmd_autostart(&args),
         "wfp" => cmd_wfp(&args),
         "--help" | "-h" | "help" => {
             eprintln!("{USAGE}");
@@ -208,7 +289,7 @@ fn load_config(args: &Args) -> Result<Config, u8> {
 
 #[cfg(feature = "gui")]
 fn cmd_gui(args: &Args) -> u8 {
-    crate::gui::run(args.config.clone())
+    crate::gui::run(args.config.clone(), args.minimised)
 }
 
 fn cmd_init(args: &Args) -> u8 {

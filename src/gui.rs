@@ -223,7 +223,7 @@ fn check_lines_from(lang: Language, result: &check::CheckResult) -> Vec<String> 
     ]
 }
 
-pub fn run(config_path: PathBuf) -> u8 {
+pub fn run(config_path: PathBuf, hidden: bool) -> u8 {
     // wgpu's default backends-ALL enumeration segfaults on some virtual displays;
     // each backend individually is fine. Honour an explicit WGPU_BACKEND if set.
     if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -236,7 +236,10 @@ pub fn run(config_path: PathBuf) -> u8 {
             .with_title("trans-proxier")
             .with_inner_size([1080.0, 720.0])
             .with_maximized(true)
-            .with_resizable(true),
+            .with_resizable(true)
+            // started from the logon entry (`--minimised`): no window, tray only. Created
+            // invisible rather than shown-then-hidden, so a window never flashes.
+            .with_visible(!hidden),
         ..Default::default()
     };
     match eframe::run_native(
@@ -337,6 +340,9 @@ struct GuiApp {
     tray_rx: Option<std::sync::mpsc::Receiver<crate::tray::TrayCmd>>,
     #[cfg(windows)]
     _tray: Option<crate::tray::Tray>,
+    /// one-shot: on the first frame after construction, start the engine if the profile
+    /// says it should run unattended (see `start_engine_on_launch`)
+    launch_pending: bool,
     // Original-style shell state (fnd_13): central view + modal editor dialogs.
     view: View,
     dlg_settings: bool,
@@ -489,6 +495,7 @@ impl GuiApp {
             tray_rx: None,
             #[cfg(windows)]
             _tray: None,
+            launch_pending: true,
             monitor,
             log_cursor: 0,
             log_view: VecDeque::new(),
@@ -1419,6 +1426,14 @@ impl GuiApp {
 
         let mut name = self.config.settings.name.clone();
         let mut start_tray = self.config.settings.start_in_tray;
+        let mut launch_engine = self.config.settings.start_engine_on_launch;
+        // read the registry rather than mirroring a setting into it: the truth about the
+        // logon entry is what the registry says, and it can be changed outside this app
+        #[cfg(windows)]
+        let at_logon = crate::autostart::status().ok().flatten().is_some();
+        #[cfg(not(windows))]
+        let at_logon = false;
+        let mut logon_toggle: Option<bool> = None;
         let mut exclusion = self.exclusion_text.clone();
         let mut inclusion = self.inclusion_text.clone();
         let mut whitelist_enabled = self.config.settings.app_whitelist_enabled;
@@ -1491,6 +1506,34 @@ impl GuiApp {
             }
         }
         ui.checkbox(&mut start_tray, tr(lang, "最小化到系统托盘（可经托盘菜单启停引擎/退出）", "Minimise to tray (start/stop engine + Quit via tray)"));
+        ui.checkbox(&mut launch_engine, tr(lang, "启动后自动开启透明引擎（需已保存全局钩子同意）", "Start the engine automatically after launch (needs saved hook consent)"));
+        ui.horizontal(|ui| {
+            ui.label(tr(lang, "开机自动运行（当前用户登录时）", "Run at logon (current user)"));
+            ui.label(if at_logon {
+                tr(lang, "已注册", "registered")
+            } else {
+                tr(lang, "未注册", "not registered")
+            });
+            if at_logon {
+                if ui.button(tr(lang, "取消注册", "Remove")).clicked() {
+                    logon_toggle = Some(false);
+                }
+            } else if ui.button(tr(lang, "注册", "Register")).clicked() {
+                logon_toggle = Some(true);
+            }
+        });
+        #[cfg(windows)]
+        if let Some(want) = logon_toggle {
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let r = if want { crate::autostart::install(&exe).map(|_| ()) } else { crate::autostart::remove() };
+            let msg = match r {
+                Ok(()) => tr(lang, "开机启动项已更新", "logon entry updated").to_string(),
+                Err(e) => format!("{}: {e}", tr(lang, "开机启动项写入失败", "logon entry failed")),
+            };
+            self.log("info", msg.to_string());
+        }
 
         sub(ui, "代理范围", "Proxy scope");
         let edit_hint = self.t("编辑列表", "Edit list");
@@ -1626,6 +1669,7 @@ impl GuiApp {
         // Write everything back once.
         self.config.settings.name = name.trim().to_string();
         self.config.settings.start_in_tray = start_tray;
+        self.config.settings.start_engine_on_launch = launch_engine;
         self.exclusion_text = exclusion;
         self.inclusion_text = inclusion;
         self.config.settings.proxy_exclusion_list = split_list(&self.exclusion_text);
@@ -2962,6 +3006,24 @@ impl GuiApp {
     #[cfg(windows)]
     fn handle_tray(&mut self, ctx: &egui::Context) {
         use crate::tray::{self, TrayCmd, TrayState};
+        // Unattended start: the logon entry brings the app up hidden, and this is what
+        // makes it actually proxy rather than sit in the tray. It refuses (with a line in
+        // the log, not silently) when hook consent was never persisted — starting the
+        // engine is a machine-visible action and must not inherit permission from a flag
+        // the operator never gave.
+        if self.launch_pending {
+            self.launch_pending = false;
+            if self.config.settings.start_engine_on_launch {
+                if self.config.settings.hook_consent {
+                    self.serve_start();
+                } else {
+                    self.log("warn", self.t(
+                        "已配置开机自动启用引擎，但缺少全局钩子同意记录 —— 请在 选项 中勾选同意后再保存",
+                        "start-engine-on-launch is set but hook consent was never saved; tick 同意 and save",
+                    ));
+                }
+            }
+        }
         if let Ok(mut st) = self.tray_state.write() {
             *st = TrayState {
                 engine_running: self.serve.is_some(),

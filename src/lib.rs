@@ -5,6 +5,8 @@ pub mod crypto;
 pub mod dns;
 pub mod engine;
 #[cfg(windows)]
+#[cfg(windows)]
+pub mod autostart;
 pub mod inject;
 pub mod intercept;
 #[cfg(feature = "gui")]

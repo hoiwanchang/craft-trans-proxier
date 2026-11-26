@@ -214,6 +214,10 @@ pub struct Settings {
     pub ip_leak_default_chain: u32,
     // Start minimised to the notification-area (system tray) icon (fnd_13 tray).
     pub start_in_tray: bool,
+    /// Start the transparent engine by itself once the app is up. The logon entry
+    /// (`autostart install`) is only half of "starts automatically": without this the
+    /// program sits in the tray doing nothing until a human presses 启动.
+    pub start_engine_on_launch: bool,
     /// Which address family the PROXY chain can reach, hence which DNS answers we may
     /// withhold from apps: "ipv4" drops AAAA, "ipv6" drops A, "dual"
     /// (the default) drops nothing.
@@ -258,6 +262,7 @@ impl Default for Settings {
             dns_no_resolve: vec!["localhost".into()],
             ip_leak_default_chain: 0,
             start_in_tray: false,
+            start_engine_on_launch: false,
             egress_family: "dual".to_string(),
             proxification_enabled: true,
             hook_consent: false,
@@ -443,6 +448,10 @@ impl Config {
                             // rejected profile — a typo in a settings file must not make the app
                             // unreadable
                             cfg.settings.egress_family = unquote(&value).trim().to_ascii_lowercase();
+                        }
+                        "start_engine_on_launch" => {
+                            cfg.settings.start_engine_on_launch = parse_bool(unquote(&value))
+                                .ok_or_else(|| format!("line {}: invalid boolean '{value}'", lineno + 1))?;
                         }
                         "start_in_tray" => {
                             cfg.settings.start_in_tray = parse_bool(unquote(&value))
@@ -815,6 +824,7 @@ impl Config {
         out.push_str(&format!("ip_leak_prevention = {}\n", self.settings.ip_leak_prevention));
         out.push_str(&format!("ip_leak_default_chain = {}\n", self.settings.ip_leak_default_chain));
         out.push_str(&format!("start_in_tray = {}\n", self.settings.start_in_tray));
+        out.push_str(&format!("start_engine_on_launch = {}\n", self.settings.start_engine_on_launch));
         out.push_str(&format!("egress_family = \"{}\"\n", self.settings.egress_family));
         out.push_str(&format!(
             "proxification_enabled = {}\n",
@@ -1119,6 +1129,21 @@ mod tests {
         let text = Config::serialize_rules(&rules);
         let back = Config::parse_rules(&text).unwrap();
         assert_eq!(back, rules, "rules must survive an export/import round-trip");
+    }
+
+    #[test]
+    fn the_unattended_launch_flags_round_trip() {
+        // Both are needed for "starts by itself at logon": one puts the app in the Run
+        // key, the other actually turns the engine on. A profile that loses either on
+        // save would silently downgrade to "app opens, does nothing".
+        let mut c = Config::default();
+        assert!(!c.settings.start_in_tray && !c.settings.start_engine_on_launch, "defaults stay manual");
+        c.settings.start_in_tray = true;
+        c.settings.start_engine_on_launch = true;
+        let text = c.serialize();
+        let back = Config::parse(&text).expect("our own profile must parse");
+        assert!(back.settings.start_in_tray, "start_in_tray survived");
+        assert!(back.settings.start_engine_on_launch, "start_engine_on_launch survived");
     }
 
     #[test]
