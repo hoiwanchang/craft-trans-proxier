@@ -839,8 +839,9 @@ fn udp_relay(relay: Arc<UdpSocket>, config: Arc<RwLock<Config>>, monitor: Arc<Mo
         let (host, port) = decision_host(&req, &pool);
         let app = image_basename(req.pid);
         let cfg = config.read().unwrap().clone();
-        let chain_egress = match decide_route(&cfg, app.as_deref(), &host, port, req.proto) {
-            Decision::Proxy { chain, .. } => config_chain_socks5(&cfg, chain),
+        let decision = decide_route(&cfg, app.as_deref(), &host, port, req.proto);
+        let chain_egress = match &decision {
+            Decision::Proxy { chain, .. } => config_chain_socks5(&cfg, *chain),
             Decision::Direct { .. } => None,
             Decision::Block { .. } => None,
         };
@@ -876,7 +877,10 @@ fn udp_relay(relay: Arc<UdpSocket>, config: Arc<RwLock<Config>>, monitor: Arc<Mo
                     format!("{host}:{port}"),
                     "UDP",
                     format!("{}:{}", proxy.host, proxy.port),
-                    "rule".into(),
+                    // the TCP path labels this with the rule that actually decided it;
+                    // UDP used a literal "rule", which read as "my rules are not being
+                    // saved" when they were — the display was the bug, not the profile.
+                    engine::rule_label(&decision),
                 );
                 let flag = Arc::new(AtomicBool::new(false));
                 // Decided ONCE, here, where the proxy this flow actually uses is known:
