@@ -1,0 +1,146 @@
+name: build-release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: unit tests (windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      # What CI runs, and — deliberately — what it does not.
+      #
+      # The integration suites in tests/ install the interception hook into their own
+      # process (LoadLibrary + inline detours over ws2_32) and, for the injection test,
+      # launch and inject a real GUI application. That needs an interactive desktop and
+      # an engine mutex/pipe namespace of its own; on a shared CI runner it is flaky at
+      # best, and a test suite that injects into other processes is not something to run
+      # unattended on somebody else's machine. They are therefore local-only and are run
+      # by the operator before a release — see README "Build & run".
+      - name: unit tests (lib + bins)
+        run: cargo test --workspace --lib --bins --no-fail-fast
+
+      # Advisory: the codebase still carries legacy style lints. Failing the build on
+      # them would hide real breakage; burn them down before flipping this to -D warnings.
+      - name: clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+  driver-offline-checks:
+    name: kernel driver offline checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The WFP callout is C against the real fwpsk.h and needs the WDK to compile and a
+      # test-signed host to load, neither of which exists here. What IS runnable in CI is
+      # the offline verification driver_wfp/build.ps1 -Test performs with a plain C
+      # compiler: encoder byte-equality against the Rust spec, the ABI agreement check,
+      # and the classify-callback harness executed as host code. If no C compiler is on
+      # the runner this step says so instead of passing silently.
+      - name: install a C compiler for the offline checks
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            choco install mingw -y --no-progress | Out-Null
+          }
+          (Get-Command gcc -ErrorAction SilentlyContinue) ? "gcc: $(gcc --version | Select-Object -First 1)" : "gcc unavailable"
+
+      - name: run offline checks
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gcc -ErrorAction SilentlyContinue)) {
+            Write-Host "::warning::no C compiler available — the driver's offline checks did NOT run"
+            exit 0
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File driver_wfp/build.ps1 -Test
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  release:
+    name: package release build
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,i686-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Both bitnesses are shipped: tpdrv.dll is injected into target processes, and a
+      # 32-bit application cannot load a 64-bit DLL (and vice versa).
+      - name: build x64 release
+        run: cargo build --workspace --release --target x86_64-pc-windows-msvc
+
+      - name: build i686 release
+        run: cargo build --workspace --release --target i686-pc-windows-msvc
+
+      - name: assemble portable package
+        shell: pwsh
+        run: |
+          $x = "target/x86_64-pc-windows-msvc/release"
+          $i = "target/i686-pc-windows-msvc/release"
+          $out = "dist/trans-proxier-win-x64"
+          New-Item -ItemType Directory -Force -Path $out, "$out/i686" | Out-Null
+          foreach ($f in "trans-proxier.exe", "tpinject.exe", "tpdrv.dll", "tphelper.exe") {
+            if (Test-Path "$x/$f") { Copy-Item "$x/$f" $out }
+          }
+          foreach ($f in "tpdrv.dll", "tpinject.exe") {
+            if (Test-Path "$i/$f") { Copy-Item "$i/$f" "$out/i686" }
+          }
+          Copy-Item README.md $out
+          # No Settings.ini in the package on purpose: the live profile in the working
+          # tree contains operator-specific proxy hosts and program paths.
+          Compress-Archive -Path "$out/*" -DestinationPath "trans-proxier-win-x64.zip" -Force
+          Get-ChildItem -Recurse $out | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trans-proxier-win-x64
+          path: trans-proxier-win-x64.zip
+          if-no-files-found: error
+
+      - name: attach to the GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "trans-proxier $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            trans-proxier-win-x64.zip || \
+          gh release upload "$GITHUB_REF_NAME" trans-proxier-win-x64.zip --clobber
+
+      # The kernel callout is deliberately NOT part of this package: it is only
+      # Authenticode test-signed here, so shipping it would hand out an image that no
+      # machine can load without disabling Secure Boot / memory integrity.
+      - name: note on the driver
+        shell: pwsh
+        run: |
+          Write-Host "tpdrv_wfp.sys is NOT published here: it is test-signed only."
+          Write-Host "Loading it requires Secure Boot / memory integrity changes - see docs/WFP_ROADMAP.md."

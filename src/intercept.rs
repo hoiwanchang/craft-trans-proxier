@@ -435,7 +435,7 @@ fn serve_pipe_one(pipe: HANDLE, config: &Config, tcp_port: u16, tcp_port_v6: u16
                 remember_pending(lp, req);
             }
             let resp = Resp { magic: MAGIC, action: 0, ..Default::default() };
-            let b = unsafe {
+            let b = {
                 std::slice::from_raw_parts(&resp as *const Resp as *const u8, std::mem::size_of::<Resp>())
             };
             let mut put = 0u32;
