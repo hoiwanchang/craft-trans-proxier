@@ -724,6 +724,33 @@ unsafe fn alloc_trampoline_near(target: usize, size: usize, need_near: bool) -> 
 //     that still runs inside an already-injected process.
 // ══════════════════════════════════════════════════════════════════════════
 
+/// Addresses that must never be tunnelled, no matter what the rules say.
+///
+/// Loopback, link-local (APIPA / SLAAC / LLv6), multicast — including mDNS
+/// `224.0.0.251:5353` and `ff02::fb:5353`, which a browser uses for discovery — and the
+/// v4 broadcast address. A SOCKS/HTTP proxy cannot deliver link-local or multicast at
+/// all: it is scoped to the local link by definition, so tunneling it is not "proxied",
+/// it is "broken", and it fills the connection list with rows that can never succeed.
+/// Measured 2026-11-26: chrome.exe rows for exactly these destinations.
+fn stays_direct(family: u16, addr: &[u8; 16]) -> bool {
+    if family == AF_INET {
+        let (a, b) = (addr[0], addr[1]);
+        return a == 127 // loopback
+            || a == 0 // "this host"
+            || a == 169 && b == 254 // link-local / APIPA
+            || a >= 224 && a <= 239 // IPv4 multicast
+            || a == 255 && b == 255; // broadcast (255.255.0.0/16 covers the used form)
+    }
+    // v6: ::1, unallocated ::, fe80::/10 link-local, ff00::/8 multicast
+    if addr[..15].iter().all(|&x| x == 0) {
+        return true; // :: and ::1
+    }
+    if addr[0] == 0xff {
+        return true; // multicast, incl. ff02::fb (mDNS)
+    }
+    (addr[0] == 0xfe) && (addr[1] & 0xc0) == 0x80 // fe80::/10
+}
+
 /// Largest window install_jmp ever displaces (a decoded instruction boundary can
 /// exceed the 14-byte patch), which is also why `orig` is sized from it.
 const ORIG_MAX: usize = 64;
@@ -1396,16 +1423,22 @@ unsafe fn udp_send_impl(s: SOCKET, buf: *const i8, len: i32, flags: i32, to: *co
     let (addr, port_be): ([u8; 16], u16) = if family == AF_INET {
         if tolen < std::mem::size_of::<SOCKADDR_IN>() as i32 { return None; }
         let sin = &*(to as *const SOCKADDR_IN);
-        if sin.sin_addr[0] == 127 { return None; } // loopback stays direct
+        let mut a4 = [0u8; 16];
+        a4[..4].copy_from_slice(&sin.sin_addr);
+        if stays_direct(AF_INET, &a4) {
+            return None; // loopback / link-local / mDNS / broadcast stay on the host
+        }
         let mut a = [0u8; 16];
         a[..4].copy_from_slice(&sin.sin_addr);
         (a, sin.sin_port)
     } else {
         if tolen < std::mem::size_of::<SOCKADDR_IN6>() as i32 { return None; }
         let sin6 = &*(to as *const SOCKADDR_IN6);
-        // ::1 (loopback) stays direct.
-        let is_loopback = sin6.sin6_addr[..15].iter().all(|&b| b == 0) && sin6.sin6_addr[15] == 1;
-        if is_loopback { return None; }
+        // ::1, fe80::/10 and ff00::/8 (mDNS lives here) must not be tunnelled: a proxy
+        // cannot deliver link-local or multicast traffic by definition.
+        if stays_direct(AF_INET6, &sin6.sin6_addr) {
+            return None;
+        }
         (sin6.sin6_addr, sin6.sin6_port)
     };
     let dst: DstKey = (family, addr, port_be);
@@ -2840,4 +2873,39 @@ mod select_abi_tests {
         assert_eq!(unsafe { fds_get(p as *const FdSetWin) }.len(), 5);
     }
 
+}
+
+#[cfg(test)]
+mod stays_direct_tests {
+    use super::{stays_direct, AF_INET, AF_INET6};
+
+    fn v4(a: [u8; 4]) -> [u8; 16] {
+        let mut x = [0u8; 16];
+        x[..4].copy_from_slice(&a);
+        x
+    }
+
+    #[test]
+    fn link_local_multicast_and_loopback_are_never_tunnelled() {
+        for a in [v4([127, 0, 0, 1]), v4([0, 0, 0, 0]), v4([169, 254, 1, 5]),
+                  v4([224, 0, 0, 251]), v4([239, 255, 255, 250]), v4([255, 255, 255, 255])] {
+            assert!(stays_direct(AF_INET, &a), "v4 {a:?} must stay direct");
+        }
+        let mdns6 = { let mut x = [0u8; 16]; x[0] = 0xff; x[1] = 0x02; x[15] = 0xfb; x };
+        let ll6 = { let mut x = [0u8; 16]; x[0] = 0xfe; x[1] = 0x80; x };
+        assert!(stays_direct(AF_INET6, &mdns6), "ff02::fb (mDNS) cannot cross a proxy");
+        assert!(stays_direct(AF_INET6, &ll6), "fe80::/10 is link-scoped");
+        let zero = [0u8; 16];
+        assert!(stays_direct(AF_INET6, &zero), ":: / ::1");
+    }
+
+    #[test]
+    fn real_unicast_still_goes_through_the_proxy() {
+        // the inverse, so the exemption cannot quietly swallow everything
+        assert!(!stays_direct(AF_INET, &v4([1, 1, 1, 1])), "1.1.1.1 is proxied");
+        assert!(!stays_direct(AF_INET, &v4([10, 0, 0, 8])), "RFC1918 is NOT exempt");
+        assert!(!stays_direct(AF_INET, &v4([172, 16, 0, 1])));
+        let g6 = { let mut x = [0u8; 16]; x[0] = 0x20; x[1] = 0x01; x[15] = 0x11; x };
+        assert!(!stays_direct(AF_INET6, &g6), "global IPv6 must still be proxied");
+    }
 }
