@@ -1000,14 +1000,65 @@ pub struct Servers {
 impl Servers {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        for handle in [&self.active_pipe, &self.active_dns] {
-            let p = handle.swap(0, Ordering::SeqCst);
-            if p != 0 {
-                unsafe {
-                    CloseHandle(p as HANDLE);
-                }
+        // Both accept loops are parked inside `ConnectNamedPipe`, so nudge each one to
+        // finish that call. Without this the loops never observe `stop`, and closing
+        // their handles instead would block until a client arrived - which is the hang
+        // that kept trans-proxier resident after its window was closed.
+        interrupt_pipe_wait(&pipe_name());
+        interrupt_pipe_wait(&dns_pipe_name());
+        // One turn of the loops is enough (they re-test `stop` right after the
+        // transaction). Bounded, because a stalled handler must never be able to make
+        // process exit depend on it.
+        let deadline = std::time::Instant::now() + Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            if self.pending_pipes() == 0 {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Pipe instances currently mid-accept. Used to know the loops actually drained.
+    pub fn pending_pipes(&self) -> usize {
+        [&self.active_pipe, &self.active_dns]
+            .iter()
+            .filter(|h| h.load(Ordering::SeqCst) != 0)
+            .count()
+    }
+}
+
+/// Wake a thread parked in a synchronous `ConnectNamedPipe` without touching its
+/// handle.
+///
+/// `CloseHandle` from another thread does NOT cancel a pending operation: it waits for
+/// it to complete, and completing it needs a client. That is why stopping the engine
+/// used to hang forever inside `Engine::drop` (and, had a client arrived, the handler
+/// thread would then have worked on a handle somebody else closed). Connecting to the
+/// pipe ourselves ends the wait on the loop's own terms: `serve_pipe_one` reads nothing
+/// usable, returns immediately, the loop re-tests the stop flag and exits.
+fn interrupt_pipe_wait(name: &str) {
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16, access: u32, share: u32, sa: *const c_void,
+            disp: u32, flags: u32, template: *mut c_void,
+        ) -> *mut c_void;
+    }
+    const GENERIC_READ_WRITE: u32 = 0x8000_0000 | 0x4000_0000; // GENERIC_READ | GENERIC_WRITE
+    const OPEN_EXISTING: u32 = 3;
+    let w = wide(name);
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            GENERIC_READ_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if h != INVALID_HANDLE_VALUE && !h.is_null() {
+        unsafe { CloseHandle(h) };
     }
 }
 
