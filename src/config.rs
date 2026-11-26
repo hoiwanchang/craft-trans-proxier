@@ -214,6 +214,16 @@ pub struct Settings {
     pub ip_leak_default_chain: u32,
     // Start minimised to the notification-area (system tray) icon (fnd_13 tray).
     pub start_in_tray: bool,
+    /// Which address family the PROXY chain can reach, hence which DNS answers we may
+    /// withhold from apps: "ipv4" drops AAAA, "ipv6" drops A, "dual"
+    /// (the default) drops nothing.
+    ///
+    /// Deliberately opt-in. The local routing table is NOT evidence: a proxy listening
+    /// on 127.0.0.1 forwards to remote nodes whose egress we cannot see, and an app
+    /// socket dialled to an IPv6 literal is connected by the PROXY (SOCKS5 ATYP 4 over
+    /// a v4 loopback hop). Trimming on a guess would turn IPv6-only origins into
+    /// "unreachable", which costs more than the failed attempt it saves.
+    pub egress_family: String,
     // Global proxification switch (the original's "Pause / No Proxification"): when
     // false every connection bypasses the proxy and goes direct, regardless of rules.
     pub proxification_enabled: bool,
@@ -248,6 +258,7 @@ impl Default for Settings {
             dns_no_resolve: vec!["localhost".into()],
             ip_leak_default_chain: 0,
             start_in_tray: false,
+            egress_family: "dual".to_string(),
             proxification_enabled: true,
             hook_consent: false,
             dns: DnsSettings::default(),
@@ -426,6 +437,12 @@ impl Config {
                         "ip_leak_default_chain" => {
                             cfg.settings.ip_leak_default_chain = unquote(&value).parse::<u32>()
                                 .map_err(|_| format!("line {}: invalid number '{value}'", lineno + 1))?;
+                        }
+                        "egress_family" => {
+                            // deliberately lenient: an unknown word means "auto", never a
+                            // rejected profile — a typo in a settings file must not make the app
+                            // unreadable
+                            cfg.settings.egress_family = unquote(&value).trim().to_ascii_lowercase();
                         }
                         "start_in_tray" => {
                             cfg.settings.start_in_tray = parse_bool(unquote(&value))
@@ -798,6 +815,7 @@ impl Config {
         out.push_str(&format!("ip_leak_prevention = {}\n", self.settings.ip_leak_prevention));
         out.push_str(&format!("ip_leak_default_chain = {}\n", self.settings.ip_leak_default_chain));
         out.push_str(&format!("start_in_tray = {}\n", self.settings.start_in_tray));
+        out.push_str(&format!("egress_family = \"{}\"\n", self.settings.egress_family));
         out.push_str(&format!(
             "proxification_enabled = {}\n",
             self.settings.proxification_enabled

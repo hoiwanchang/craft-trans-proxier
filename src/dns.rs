@@ -534,3 +534,207 @@ mod snoop_tests {
         assert!(pool.observed_name(IpAddr::V4(Ipv4Addr::new(198, 51, 16, 33))).is_some(), "newest survive");
     }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Address-family policy: which query types this machine's proxy chain can answer
+//
+// Motivation, measured rather than assumed: with the proxy on 127.0.0.1:7890 the
+// egress IS this machine, and this machine has a single v4 default route, no ::/0
+// route and only a Tailscale ULA address. Any AAAA handed to an app is therefore a
+// destination that cannot be reached, and the app pays a failed v6 attempt before
+// falling back - which reads to the user as "some sites are slow or flaky since I
+// turned the transparent engine on".
+//
+// Suppressing AAAA *queries* with a valid empty answer is preferred over rewriting
+// the proxied response: a query has one question record and a fixed shape, whereas
+// trimming answers means walking variable-length RRs and recompressing names - and a
+// mistake there corrupts the resolver output of every whitelisted app.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FamilyPolicy {
+    /// Only IPv4 reaches the world: suppress AAAA.
+    Ipv4Only,
+    /// Only IPv6 reaches the world: suppress A.
+    Ipv6Only,
+    /// Both work: touch nothing.
+    Dual,
+}
+
+impl FamilyPolicy {
+    pub fn parse(s: &str) -> FamilyPolicy {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ipv4" | "v4" | "4" => FamilyPolicy::Ipv4Only,
+            "ipv6" | "v6" | "6" => FamilyPolicy::Ipv6Only,
+            "dual" | "both" | _ => FamilyPolicy::Dual,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FamilyPolicy::Ipv4Only => "ipv4",
+            FamilyPolicy::Ipv6Only => "ipv6",
+            FamilyPolicy::Dual => "dual",
+        }
+    }
+
+    /// Which qtype (if any) must be answered locally under this policy.
+    pub fn suppressed_qtype(self) -> Option<u16> {
+        match self {
+            FamilyPolicy::Ipv4Only => Some(28), // AAAA
+            FamilyPolicy::Ipv6Only => Some(1),  // A
+            FamilyPolicy::Dual => None,
+        }
+    }
+}
+
+/// Build a NOERROR/0-answer reply for a query, copying the question section verbatim.
+/// Returns None unless the buffer looks like a well-formed standard query with exactly
+/// one question - the caller must then forward the datagram untouched, so a malformed
+/// or unexpected packet can never be answered wrongly.
+pub fn empty_answer_for(req: &[u8]) -> Option<Vec<u8>> {
+    if req.len() < 13 {
+        return None;
+    }
+    // only respond to a standard query: RD/CD bits vary, the opcode must be 0 and QR 0
+    if req[2] & 0x80 != 0 || (req[2] >> 3) & 0x0F != 0 {
+        return None;
+    }
+    if u16::from_be_bytes([req[4], req[5]]) != 1 {
+        return None; // one question is all the DNS path here ever issues
+    }
+    if u16::from_be_bytes([req[6], req[7]]) != 0 {
+        return None; // answers/authority/additional present in a "query" - not ours
+    }
+    // walk the QNAME, then require QTYPE+QCLASS to be present and nothing else
+    let mut i = 12usize;
+    loop {
+        if i >= req.len() {
+            return None;
+        }
+        let l = req[i];
+        if l & 0xC0 != 0 {
+            return None; // compressed names do not occur in queries
+        }
+        if l == 0 {
+            i += 1;
+            break;
+        }
+        if l > 63 {
+            return None;
+        }
+        i += 1 + l as usize;
+    }
+    if i + 4 > req.len() {
+        return None;
+    }
+    let question = req[12..i + 4].to_vec();
+    if i + 4 != req.len() {
+        return None; // trailing options (EDNS0) — leave the packet alone
+    }
+    let mut out = Vec::with_capacity(12 + question.len());
+    out.extend_from_slice(&req[0..2]); // id
+    out.push(0x81); // QR=1, RD copied as "available": response, recursion available
+    out.push(req[3]); // copy the answer RCODE field (0 here)
+    out.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    out.extend_from_slice(&[0x00, 0x00]); // ANCOUNT = 0  <- the point
+    out.extend_from_slice(&[0x00, 0x00]); // NSCOUNT = 0
+    out.extend_from_slice(&[0x00, 0x00]); // ARCOUNT = 0
+    out.extend_from_slice(&question);
+    Some(out)
+}
+
+/// The query type a request asks for, if it can be read at all.
+pub fn query_qtype(req: &[u8]) -> Option<u16> {
+    if req.len() < 14 || u16::from_be_bytes([req[4], req[5]]) != 1 {
+        return None;
+    }
+    let mut i = 12usize;
+    loop {
+        let l = *req.get(i)?;
+        if l & 0xC0 != 0 {
+            return None;
+        }
+        if l == 0 {
+            i += 1;
+            break;
+        }
+        if l > 63 {
+            return None;
+        }
+        i += 1 + l as usize;
+    }
+    Some(u16::from_be_bytes([*req.get(i)?, *req.get(i + 1)?]))
+}
+
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    fn query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut v = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for lbl in name.split('.') {
+            v.push(lbl.len() as u8);
+            v.extend_from_slice(lbl.as_bytes());
+        }
+        v.push(0);
+        v.extend_from_slice(&qtype.to_be_bytes());
+        v.extend_from_slice(&1u16.to_be_bytes()); // IN
+        v
+    }
+
+    #[test]
+    fn trimming_is_opt_in_and_the_default_touches_nothing() {
+        // The honest default: nothing is suppressed unless the operator names a family,
+        // because the local routing table says nothing about the proxy's own egress.
+        assert_eq!(FamilyPolicy::parse("dual").suppressed_qtype(), None);
+        assert_eq!(FamilyPolicy::parse("").suppressed_qtype(), None);
+        assert_eq!(FamilyPolicy::parse("whatever").suppressed_qtype(), None);
+        // explicit opt-in, both directions
+        assert_eq!(FamilyPolicy::parse("ipv4").suppressed_qtype(), Some(28));
+        assert_eq!(FamilyPolicy::parse("IPv6").suppressed_qtype(), Some(1));
+    }
+
+    #[test]
+    fn the_empty_answer_copies_the_question_and_zeroes_the_answers() {
+        let q = query("www.example.com", 28);
+        assert_eq!(query_qtype(&q), Some(28));
+        let r = empty_answer_for(&q).expect("a plain query must be answerable");
+        assert_eq!(&r[0..2], &q[0..2], "the id must match");
+        assert_eq!(r[2] & 0x80, 0x80, "QR must be 1");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "ANCOUNT must be 0");
+        assert_eq!(&r[12..], &q[12..], "the question section is copied verbatim");
+    }
+
+    #[test]
+    fn anything_unexpected_is_left_alone() {
+        // Each of these must return None so the caller forwards the packet untouched:
+        // answering something we half-understood is how a resolver lies to an app.
+        assert!(empty_answer_for(&[]).is_none(), "empty");
+        assert!(empty_answer_for(&[0u8; 6]).is_none(), "too short");
+        let mut resp = query("a.b", 1);
+        resp[2] |= 0x80;
+        assert!(empty_answer_for(&resp).is_none(), "already a response");
+        let mut two = query("a.b", 1);
+        two[4..6].copy_from_slice(&2u16.to_be_bytes());
+        assert!(empty_answer_for(&two).is_none(), "two questions");
+        let mut edns = query("a.b", 1);
+        edns.extend_from_slice(&[0, 0x29, 0, 0, 0, 0, 0, 0]); // an OPT record
+        assert!(empty_answer_for(&edns).is_none(), "EDNS0 present - out of scope");
+        let mut bad_len = query("a.b", 1);
+        bad_len[12] = 200; // label length byte > 63
+        assert!(empty_answer_for(&bad_len).is_none(), "malformed name");
+    }
+
+    #[test]
+    fn the_policy_round_trips_through_its_config_spelling() {
+        for p in [FamilyPolicy::Ipv4Only, FamilyPolicy::Ipv6Only, FamilyPolicy::Dual] {
+            assert_eq!(FamilyPolicy::parse(p.as_str()), p, "the value we write must read back");
+        }
+        assert_eq!(FamilyPolicy::parse("IPv4"), FamilyPolicy::Ipv4Only, "case-insensitive");
+        assert_eq!(FamilyPolicy::parse("gibberish"), FamilyPolicy::Dual, "an unknown word must not enable trimming");
+    }
+}
+

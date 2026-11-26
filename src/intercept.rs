@@ -61,6 +61,21 @@ pub fn dns_pipe_name() -> String { format!("{PIPE_NAME_DNS}{}", instance_suffix(
 pub fn wfp_pipe_name() -> String { format!("{PIPE_NAME_WFP}{}", instance_suffix()) }
 pub fn engine_mutex_name() -> String { format!("{ENGINE_MUTEX}{}", instance_suffix()) }
 
+
+/// The family policy that applies to a flow going through `proxy_host`.
+///
+/// "auto" deliberately resolves to **no trimming**. The obvious heuristic — the proxy
+/// is on loopback, therefore the egress is this machine, therefore a host with no ::/0
+/// route cannot reach IPv6 origins — is wrong for a proxy chain: a local listener like
+/// 127.0.0.1:7890 forwards to remote nodes that may well have IPv6 egress even when
+/// this box has none, and the app's v6 socket is dialled by the PROXY (SOCKS5 ATYP 4
+/// over a v4 loopback hop), not by us. Guessing here trades a small delay for
+/// unreachable IPv6-only origins, so trimming is opt-in only: set
+/// `egress_family = ipv4` / `ipv6` when you have confirmed the chain lacks that family.
+pub fn effective_family_policy(cfg: &Config, _proxy_host: &str) -> crate::dns::FamilyPolicy {
+    crate::dns::FamilyPolicy::parse(&cfg.settings.egress_family)
+}
+
 /// The control block tpdrv reads before it modifies anything. Same layout as the one
 /// in `tpdrv/src/lib.rs`; `ctl_layout_agrees_with_the_driver` is what keeps them so.
 #[repr(C)]
@@ -718,7 +733,17 @@ fn udp_relay(relay: Arc<UdpSocket>, config: Arc<RwLock<Config>>, monitor: Arc<Mo
     let _ = relay.set_read_timeout(Some(Duration::from_millis(80)));
     // app src -> (true target, upstream assoc socket, assoc relay ep, conn row,
     //             shared abort flag, last-activity)
-    type Flow = (SocketAddr, Arc<UdpSocket>, SocketAddr, Arc<crate::monitor::ConnInfo>, Arc<AtomicBool>, std::time::Instant);
+    type Flow = (
+        SocketAddr,
+        Arc<UdpSocket>,
+        SocketAddr,
+        Arc<crate::monitor::ConnInfo>,
+        Arc<AtomicBool>,
+        std::time::Instant,
+        // qtype this flow's resolver traffic must not see an answer for, decided when
+        // the flow was opened (that is the only moment the egress proxy is known).
+        Option<u16>,
+    );
     let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
     let idle_limit = Duration::from_secs(120);
@@ -769,6 +794,29 @@ fn udp_relay(relay: Arc<UdpSocket>, config: Arc<RwLock<Config>>, monitor: Arc<Mo
             if f.4.load(Ordering::SeqCst) {
                 // being reaped; ignore stragglers
             } else if !declares_flow {
+                // Address-family trimming. On a chain with no IPv6 egress a AAAA answer is
+                // a destination the app cannot reach, and the app only finds out after a
+                // failed connect — which is what "some sites are slow since I enabled the
+                // transparent engine" means. Answering the query with a valid empty answer
+                // makes it fall back to IPv4 immediately, and it is strictly local: the
+                // upstream resolver never sees a suppressed query, and nothing else is
+                // rewritten. Anything that is not a well-formed single-question query is
+                // forwarded untouched.
+                if let Some(sup) = f.6 {
+                    if crate::dns::query_qtype(data) == Some(sup) {
+                        if let Some(ans) = crate::dns::empty_answer_for(data) {
+                            let _ = relay.send_to(&ans, src);
+                            monitor.log(
+                                "info",
+                                format!(
+                                    "DNS 族裁剪: 就地空答案回给应用（此链路无 {} 出口），应用将改用另一族",
+                                    if sup == 28 { "IPv6" } else { "IPv4" },
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let framed = socks5::udp_frame(&f.0, data);
                 let _ = f.1.send_to(&framed, f.2);
                 f.3.sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -831,7 +879,26 @@ fn udp_relay(relay: Arc<UdpSocket>, config: Arc<RwLock<Config>>, monitor: Arc<Mo
                     "rule".into(),
                 );
                 let flag = Arc::new(AtomicBool::new(false));
-                flows.insert(src, (target, assoc.clone(), assoc_relay, flow.clone(), flag.clone(), std::time::Instant::now()));
+                // Decided ONCE, here, where the proxy this flow actually uses is known:
+                // re-deriving it per datagram would need another config read and could pick a
+                // different chain than the one the flow was opened on.
+                let fam_suppress = if port == 53 {
+                    effective_family_policy(&cfg, &proxy.host).suppressed_qtype()
+                } else {
+                    None
+                };
+                flows.insert(
+                    src,
+                    (
+                        target,
+                        assoc.clone(),
+                        assoc_relay,
+                        flow.clone(),
+                        flag.clone(),
+                        std::time::Instant::now(),
+                        fam_suppress,
+                    ),
+                );
                 // Passive DNS observation: when this flow carries resolver traffic, the
                 // replies name the addresses the app is about to connect to — which is
                 // how a hostname rule can match a connect that arrives as a bare IP
@@ -1665,5 +1732,65 @@ mod req_abi_probe {
         assert_eq!(std::mem::offset_of!(super::Ctl, teardown), 0);
         assert_eq!(std::mem::offset_of!(super::Ctl, apps_len), 4);
         assert_eq!(std::mem::offset_of!(super::Ctl, apps), 8);
+    }
+}
+
+#[cfg(test)]
+mod family_wiring_tests {
+    use super::*;
+
+    fn cfg_with(v: &str) -> Config {
+        let mut c = Config::default();
+        c.settings.egress_family = v.to_string();
+        c
+    }
+
+    #[test]
+    fn an_explicit_policy_wins_over_the_probe() {
+        // The operator saying "ipv4" must be honoured even on a machine that does have
+        // IPv6, and "dual" must disable trimming even on one that does not: the auto
+        // probe must never override an explicit choice.
+        assert_eq!(
+            effective_family_policy(&cfg_with("ipv4"), "127.0.0.1").suppressed_qtype(),
+            Some(28)
+        );
+        assert_eq!(
+            effective_family_policy(&cfg_with("dual"), "127.0.0.1").suppressed_qtype(),
+            None
+        );
+        assert_eq!(
+            effective_family_policy(&cfg_with("ipv6"), "127.0.0.1").suppressed_qtype(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn auto_never_suppresses_even_without_local_v6() {
+        // The whole point: this machine may have no IPv6 route while the proxy's egress
+        // does. Trimming on the local routing table would make IPv6-only origins
+        // unreachable, which is worse than the delay it saves.
+        let c = cfg_with("auto");
+        assert_eq!(effective_family_policy(&c, "127.0.0.1").suppressed_qtype(), None);
+        assert_eq!(effective_family_policy(&c, "203.0.113.9").suppressed_qtype(), None);
+        // and the explicit opt-in still works, in both directions
+        assert_eq!(
+            effective_family_policy(&cfg_with("ipv4"), "127.0.0.1").suppressed_qtype(),
+            Some(28),
+            "an operator who HAS confirmed no v6 egress can still trim AAAA"
+        );
+        assert_eq!(
+            effective_family_policy(&cfg_with("ipv6"), "127.0.0.1").suppressed_qtype(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_profile_key_round_trips() {
+        let mut c = Config::default();
+        assert_eq!(c.settings.egress_family, "dual", "default must trim nothing");
+        c.settings.egress_family = "ipv4".into();
+        let text = c.serialize();
+        let back = Config::parse(&text).expect("the profile we wrote must parse");
+        assert_eq!(back.settings.egress_family, "ipv4");
     }
 }
