@@ -108,7 +108,10 @@ jobs:
   release:
     name: package release build
     needs: [test]
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # Package on every push to main and on manual runs, not only on tags: a build you
+    # can download should not require deciding that a commit is "a release". Only the
+    # GitHub Release itself stays tag-gated (see the attach step below).
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,12 +146,17 @@ jobs:
           Copy-Item README.md $out
           # No Settings.ini in the package on purpose: the live profile in the working
           # tree contains operator-specific proxy hosts and program paths.
+          # stamp what this build actually is, so a downloaded zip is never anonymous
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          "trans-proxier $ver`ncommit $env:GITHUB_SHA`nbuilt $((Get-Date).ToString('s'))`n" |
+            Set-Content -Path "$out/VERSION.txt" -Encoding utf8
           Compress-Archive -Path "$out/*" -DestinationPath "trans-proxier-win-x64.zip" -Force
           Get-ChildItem -Recurse $out | Select-Object FullName, Length | Format-Table -AutoSize
 
       - uses: actions/upload-artifact@v4
         with:
-          name: trans-proxier-win-x64
+          # the run number keeps each build distinguishable in the Artifacts list
+          name: trans-proxier-win-x64-${{ github.run_number }}
           path: trans-proxier-win-x64.zip
           if-no-files-found: error
 
