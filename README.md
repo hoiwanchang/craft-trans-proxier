@@ -172,7 +172,7 @@ side fails exactly one test. 0 warnings, x64 + i686.
 | 12 | 实时日志过滤：协议 / 目的 IP / 端口 / 是否直连，默认只显示走代理的<br>Live-log filter incl. proxied-only default | ✅👁 | 谓词是纯函数且有单测（非流行永不隐藏、半输入不清空）；**面板外观需你目视** |
 | 13 | 托盘菜单 + 多尺寸图标（按 DPI 选档）<br>Tray menu + DPI-sized icon | ✅👁 | 图标已内嵌 exe 并解析校验；**观感需你目视** |
 | 14 | Profiles：多档案、加密保存、启动加载<br>Profiles with encryption | 🟡👁 | 逻辑测试通过；对话框从未在屏幕上看到 |
-| 15 | WFP 内核重定向（callout 驱动 + 控制面）<br>WFP kernel redirect | ⛔🟡 | 用户态控制面、驱动源码、ABI 布局、classify 逻辑执行（185 C 检查含 4000 例不变量）与**已签名镜像**都在；**唯一没做的：在 test-signing VM 里加载并让 `wfp --verify` 全绿**（任务 #4） |
+| 15 | WFP 内核重定向（callout 驱动 + 控制面）<br>WFP kernel redirect | ⛔ **已决定不做** | 卡在**签名**而不是验证:Windows 10 1607 起内核驱动必须由微软签名,因此自签测试镜像在 Secure Boot 开启或 HVCI(内存完整性)开启时一律被拒——这台机器 HVCI 实测为 ON。要走这条路需要 EV 证书 + Attestation Signing,已确认不做。产物(driver_wfp/、185 C 检查、ABI 钉版、签名镜像)保留在仓库里作为已验证的代码,但**不发布、不计划加载** |
 | 16 | DNS 地址族裁剪（按代理链路能力丢弃 AAAA/A）<br>DNS family trimming | 🟡⛔默认关 | 机制与包构造有测试；`egress_family` 默认 `dual`＝不裁剪。原因：你的出口有 v6 而本机无 v6，本地路由表不是证据，误裁剪会让 v6-only 站点永久不可达 |
 | 17 | DoH / TRR（Firefox 自建 DNS）场景<br>DoH/TRR coverage | ⛔ | DNS 在 TLS 内，我们不解析；族裁剪对这条路径无效（已记录在案） |
 | 18 | 打补丁/还原时逐线程挂起（防撕裂执行）#22<br>Per-thread suspend around patching | ⛔已回退 | 代码在 `stash@{0}`。两条硬结论：`NtSuspendProcess(self)` 直接冻死本进程；改逐线程后仍把一个 charmap 卡住 20 分钟 ⇒ 风险大于收益 |

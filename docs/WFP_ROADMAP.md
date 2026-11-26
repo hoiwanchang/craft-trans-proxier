@@ -1,5 +1,19 @@
 # WFP redirect route — status, what's done, and what you must install
 
+> **DECISION 2026-11-26: this route is dropped; the product ships user-mode interception only.**
+>
+> The blocker is signing, not testing. Since Windows 10 1607 a kernel-mode driver must
+> carry a Microsoft signature, so our self-signed test image is refused whenever Secure
+> Boot is on **and** whenever memory integrity (HVCI) is on — and HVCI was measured ON on
+> the operator's workstation. Making it load would mean permanently weakening the machine,
+> and making it *shippable* would mean an EV certificate plus attestation signing, which
+> the operator has ruled out.
+>
+> Everything below stays in the tree as verified code (callout logic executed host-side,
+> ABI pinned against the real SDK headers, a buildable and Authenticode-signed image), but
+> it is **not published in the release zip and there is no plan to load it**. The VM
+> acceptance run further down is kept documented for anyone who revisits the decision.
+
 Goal: per-connection redirect via the Windows Filtering Platform (WFP) so a
 whitelisted program's traffic is proxied **without injecting a DLL into it**
 (no message-hook, no per-process patching). This removes the driverless engine's
