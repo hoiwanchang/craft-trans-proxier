@@ -29,6 +29,11 @@ use crate::rules::{decide_route, is_whitelisted, Decision};
 use crate::socks5;
 
 pub const MAGIC: u32 = 0x5052_5831; // "PRX1" — the wire handshake tpdrv and the engine share
+/// Same 32-byte record, second intent: "this app socket's local port belongs to the
+/// destination in this record". Sent AFTER the decision (binding earlier could trap a
+/// socket that turns out to be direct on the loopback address), and BEFORE the connect,
+/// so the mapping exists by the time the redirected connection is accepted.
+pub const MAGIC_REG: u32 = 0x5052_5832; // "PRX2"
 const ACTION_DIRECT: u32 = 0;
 const ACTION_PROXY: u32 = 1;
 const ACTION_BLOCK: u32 = 2;
@@ -134,6 +139,47 @@ pub fn req_from_flow(rec: &crate::wfp_classify::FlowRecord) -> Req {
         proto: if rec.proto == 0 { IPPROTO_UDP } else { rec.proto },
         _pad: [0; 3],
     }
+}
+
+/// The app socket's own port, when the hook told us it (bytes 1..3 of the old
+/// `_pad`, so the 32-byte ABI and its pinned offsets are unchanged). A non-blocking
+/// client cannot be given the in-band destination header — the application may write
+/// its own first bytes as soon as FD_CONNECT arrives, and whoever writes first wins —
+/// so the hook binds first, reports the local port here, and the relay resolves the
+/// destination from it when the redirected connection is accepted.
+pub fn req_local_port(req: &Req) -> Option<u16> {
+    let p = u16::from_be_bytes([req._pad[1], req._pad[2]]);
+    (p != 0).then_some(p)
+}
+
+/// Out-of-band destination table: app local port → the request that made it. Bounded
+/// and evicting, because a client that binds and then never connects would otherwise
+/// grow it forever, and an unbounded table in a proxy is just a memory leak with extra
+/// steps. Entries are consumed on use.
+const PENDING_MAX: usize = 4096;
+
+fn pending() -> &'static Mutex<std::collections::VecDeque<(u16, Req)>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Mutex<std::collections::VecDeque<(u16, Req)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn remember_pending(port: u16, req: Req) {
+    let mut q = pending().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = q.iter_mut().find(|(p, _)| *p == port) {
+        existing.1 = req;
+        return;
+    }
+    if q.len() >= PENDING_MAX {
+        q.pop_front();
+    }
+    q.push_back((port, req));
+}
+
+fn take_pending(port: u16) -> Option<Req> {
+    let mut q = pending().lock().unwrap_or_else(|e| e.into_inner());
+    let i = q.iter().position(|(p, _)| *p == port)?;
+    q.remove(i).map(|(_, r)| r)
 }
 
 #[repr(C)]
@@ -305,6 +351,12 @@ fn decision_host(req: &Req, pool: &FakeIpPool) -> (String, u16) {
 /// Per-connection decision. UDP flows additionally require the chain egress to be
 /// SOCKS5 (HTTP CONNECT cannot carry UDP — fnd_10); otherwise we leave UDP direct.
 fn decide_for(req: &Req, config: &Config, tcp_port: u16, tcp_port_v6: u16, udp_port: u16, udp_port_v6: u16, pool: &FakeIpPool) -> Resp {
+    // Record the destination against the app socket's own port FIRST: a non-blocking
+    // client may write before any header could be sent, and the redirected connection
+    // arriving on the relay is then resolved by its peer port instead.
+    if let Some(lp) = req_local_port(req) {
+        remember_pending(lp, *req);
+    }
     let (host, port) = decision_host(req, pool);
     let app = image_basename(req.pid);
     match decide_route(config, app.as_deref(), &host, port, req.proto) {
@@ -373,7 +425,24 @@ fn serve_pipe_one(pipe: HANDLE, config: &Config, tcp_port: u16, tcp_port_v6: u16
             &mut read,
             std::ptr::null_mut(),
         );
-        if ok == 0 || read as usize != std::mem::size_of::<Req>() || req.magic != MAGIC {
+        if ok == 0 || read as usize != std::mem::size_of::<Req>() {
+            return;
+        }
+        if req.magic == MAGIC_REG {
+            // Registration only. Answer with a normal (unused) verdict so the hook's
+            // existing reply validation passes and no second protocol fork is needed.
+            if let Some(lp) = req_local_port(&req) {
+                remember_pending(lp, req);
+            }
+            let resp = Resp { magic: MAGIC, action: 0, ..Default::default() };
+            let b = unsafe {
+                std::slice::from_raw_parts(&resp as *const Resp as *const u8, std::mem::size_of::<Resp>())
+            };
+            let mut put = 0u32;
+            WriteFile(pipe, b.as_ptr(), b.len() as u32, &mut put, std::ptr::null_mut());
+            return;
+        }
+        if req.magic != MAGIC {
             return;
         }
         let resp = decide_for(&req, config, tcp_port, tcp_port_v6, udp_port, udp_port_v6, pool);
@@ -617,6 +686,17 @@ pub(crate) fn relay_established(
     }
 }
 
+/// Resolve a pid to an image name once (the same process asks many times per second).
+fn app_of(cache: &Arc<Mutex<HashMap<u32, Option<String>>>>, pid: u32) -> Option<String> {
+    let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = m.get(&pid) {
+        return a.clone();
+    }
+    let a = image_basename(pid);
+    m.insert(pid, a.clone());
+    a
+}
+
 fn relay_server(listener: TcpListener, config: Arc<RwLock<Config>>, monitor: Arc<Monitor>, pool: Arc<FakeIpPool>, stop: Arc<AtomicBool>) {
     if listener.set_nonblocking(true).is_err() {
         return;
@@ -655,6 +735,21 @@ fn relay_server(listener: TcpListener, config: Arc<RwLock<Config>>, monitor: Arc
                             }
                         }
                     }
+                    // Out-of-band first: the hook binds before it connects precisely so
+                    // we can identify the flow without any in-band bytes.
+                    let by_port = client
+                        .peer_addr()
+                        .ok()
+                        .and_then(|a| take_pending(a.port()))
+                        .map(|req| {
+                            let (host, port) = decision_host(&req, &pool);
+                            (req, host, port)
+                        });
+                    if let Some((req, host, port)) = by_port {
+                        let app = app_of(&appcache, req.pid);
+                        relay_established(client, &host, port, app, Some(req.pid), config, monitor, None, pool.clone());
+                        return;
+                    }
                     let mut hdr = [0u8; std::mem::size_of::<Req>()];
                     if let Err(e) = client.read_exact(&mut hdr) {
                         monitor.log("warn", format!("中继: 读取钩子请求头失败（连接被提前关闭？）: {e}"));
@@ -666,16 +761,7 @@ fn relay_server(listener: TcpListener, config: Arc<RwLock<Config>>, monitor: Arc
                         return;
                     }
                     let (host, port) = decision_host(&req, &pool);
-                    let app = {
-                        let mut m = appcache.lock().unwrap();
-                        if let Some(a) = m.get(&req.pid) {
-                            a.clone()
-                        } else {
-                            let a = image_basename(req.pid);
-                            m.insert(req.pid, a.clone());
-                            a
-                        }
-                    };
+                    let app = app_of(&appcache, req.pid);
                     relay_established(client, &host, port, app, Some(req.pid), config, monitor, None, pool.clone());
                 });
             }

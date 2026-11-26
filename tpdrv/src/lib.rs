@@ -133,6 +133,10 @@ type HOOKPROC = Option<extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT>;
 // `tpinject::proto` — both sides document the same fixed little-endian layout.
 // ---------------------------------------------------------------------------
 const MAGIC: u32 = 0x5052_5831; // "PRX1"
+/// Second intent on the same 32-byte record: "this socket's local port belongs to this
+/// destination". Sent after the decision and before the connect, so the relay can
+/// identify the flow without any in-band bytes — see `register_local_port`.
+const MAGIC_REG: u32 = 0x5052_5832; // "PRX2"
 
 /// Control request the injected hook sends to the engine over the named pipe:
 /// "I am `pid`, about to connect to `target`; proxy me or leave me alone?"
@@ -161,6 +165,107 @@ struct Resp {
 
 const ACTION_PROXY: u32 = 1;
 const ACTION_BLOCK: u32 = 2;
+
+/// Bind the app's socket to the loopback address of ITS OWN family — only if it has no
+/// port yet, since binding a socket the application already bound would be lying to it —
+/// and tell the engine which local port that produced.
+///
+/// Why this exists: the destination used to travel in-band, as 32 bytes written right
+/// after connect completed. A non-blocking client (Chromium) does not wait for our write:
+/// it waits for FD_CONNECT and then sends its TLS ClientHello. Whoever writes first wins,
+/// and the loser's bytes get parsed as the other's protocol. So the engine must know the
+/// destination before any application byte arrives, and the app socket's local port is
+/// the one identifier both sides can see without inventing a token.
+///
+/// False on any failure, in which case the caller keeps the old in-band behaviour — still
+/// correct for a blocking client such as Firefox.
+unsafe fn register_local_port(s: SOCKET, family: u16, mut req: Req) -> bool {
+    unsafe extern "system" {
+        fn getsockname(s: SOCKET, name: *mut SOCKADDR, len: *mut i32) -> i32;
+        fn bind(s: SOCKET, name: *const SOCKADDR, len: i32) -> i32;
+    }
+    let mut port: u16 = 0;
+    if family == AF_INET6 {
+        let mut a = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            sin6_port: 0,
+            sin6_flowinfo: 0,
+            sin6_addr: [0u8; 16],
+            sin6_scope_id: 0,
+        };
+        let mut len = std::mem::size_of::<SOCKADDR_IN6>() as i32;
+        if getsockname(s, &mut a as *mut SOCKADDR_IN6 as *mut SOCKADDR, &mut len) == 0 {
+            port = u16::from_be(a.sin6_port);
+        }
+        if port == 0 {
+            let mut lo = SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: {
+                    let mut x = [0u8; 16];
+                    x[15] = 1; // ::1
+                    x
+                },
+                sin6_scope_id: 0,
+            };
+            let mut l2 = std::mem::size_of::<SOCKADDR_IN6>() as i32;
+            if bind(s, &lo as *const SOCKADDR_IN6 as *const SOCKADDR, l2) != 0 {
+                return false;
+            }
+            if getsockname(s, &mut lo as *mut SOCKADDR_IN6 as *mut SOCKADDR, &mut l2) != 0 {
+                return false;
+            }
+            port = u16::from_be(lo.sin6_port);
+        }
+    } else {
+        let mut a = SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: 0,
+            sin_addr: [0; 4],
+            sin_zero: [0; 8],
+        };
+        let mut len = std::mem::size_of::<SOCKADDR_IN>() as i32;
+        if getsockname(s, &mut a as *mut SOCKADDR_IN as *mut SOCKADDR, &mut len) == 0 {
+            port = u16::from_be(a.sin_port);
+        }
+        if port == 0 {
+            let lo = SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: [127, 0, 0, 1],
+                sin_zero: [0; 8],
+            };
+            if bind(
+                s,
+                &lo as *const SOCKADDR_IN as *const SOCKADDR,
+                std::mem::size_of::<SOCKADDR_IN>() as i32,
+            ) != 0
+            {
+                return false;
+            }
+            let mut got = SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: [0; 4],
+                sin_zero: [0; 8],
+            };
+            let mut l2 = std::mem::size_of::<SOCKADDR_IN>() as i32;
+            if getsockname(s, &mut got as *mut SOCKADDR_IN as *mut SOCKADDR, &mut l2) != 0 {
+                return false;
+            }
+            port = u16::from_be(got.sin_port);
+        }
+    }
+    if port == 0 {
+        return false;
+    }
+    // the record's two spare padding bytes, so the pinned 32-byte ABI does not move
+    req._pad[1] = (port >> 8) as u8;
+    req._pad[2] = (port & 0xFF) as u8;
+    req.magic = MAGIC_REG;
+    ask_engine(req).is_some()
+}
 
 /// Fail the current socket op as if the peer refused the connection
 /// (WSAECONNREFUSED = 10061) — how a matched "Block" rule is enforced in-hook.
@@ -1277,6 +1382,11 @@ unsafe fn intercept_impl<D: FnMut(*const SOCKADDR, i32) -> i32>(
             // The engine runs a dedicated IPv6-loopback relay on [::1] for v6
             // clients (std's AF_INET6 sockets are V6ONLY, so a v4-mapped address
             // would fail WSAEADDRNOTAVAIL). v4 clients use the 127.0.0.1 relay.
+            // Out-of-band registration, TCP only. `intercept` also serves *connected
+            // UDP*, whose relay path reads the in-band header as its flow declaration —
+            // suppressing it there silently breaks the UDP round-trip (caught by the
+            // live suite, which is why this line names the transport explicitly).
+            let registered = proto == IPPROTO_TCP && register_local_port(s, family, req);
             let r = if family == AF_INET6 {
                 let mut a6 = [0u8; 16];
                 a6[15] = 1; // ::1
@@ -1310,6 +1420,14 @@ unsafe fn intercept_impl<D: FnMut(*const SOCKADDR, i32) -> i32>(
             // the relay with no header → the relay misreads them as a bad magic. Wait
             // for the connect to finish, THEN stamp the header.
             let mut rr = r;
+            if registered {
+                // The relay already knows where this connection belongs. Hand the
+                // application back the kernel's own answer, untouched: a non-blocking
+                // client must see WSAEWOULDBLOCK and then receive its FD_CONNECT.
+                // Waiting here and returning 0 is what made Chromium never write a byte
+                // ("已连接 20s / 发送 0 B / ERR_TIMED_OUT") while Firefox was fine.
+                return Some(rr);
+            }
             if rr == -1 {
                 unsafe extern "system" {
                     fn WSAGetLastError() -> i32;
